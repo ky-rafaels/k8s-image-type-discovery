@@ -10,22 +10,21 @@ helm repo add prometheus-community https://prometheus-community.github.io/helm-c
 helm install prometheus-stack prometheus-community/kube-prometheus-stack -n monitoring --create-namespace
 ```
 
-## 
-Below is a Go program designed to run in Kubernetes, discover other workloads (pods), and emit Prometheus metrics about the container images and their FIPS (Federal Information Processing Standards) status. This program uses the Kubernetes client-go library to interact with the cluster and the Prometheus client library to expose metrics. It assumes it’s running inside a Kubernetes cluster with appropriate RBAC permissions.
+Here’s an updated version of the Go program that adds a new Prometheus metric to determine whether each container is FIPS (Federal Information Processing Standards) compliant. It builds on the previous code by inspecting `/etc/os-release` for FIPS-related indicators and introduces a new metric, `containers_fips_compliant`, to track the count of FIPS-compliant containers. The program continues to run in Kubernetes, discovering workloads and exposing metrics on port 8080.
 
 ---
 
 ### Program Overview
 - **Functionality**:
-  - Queries all pods in the cluster.
-  - Extracts container images and checks for FIPS-enabled status (based on a heuristic, e.g., image names containing "fips").
-  - Exposes two Prometheus metrics:
+  - Queries all pods in the cluster every 30 seconds.
+  - Emits four Prometheus metrics:
+    - `pods_per_namespace`: Number of pods per namespace.
     - `container_image_count`: Number of containers per image.
-    - `workload_fips_enabled`: Whether a workload (pod) uses FIPS-enabled images (1 or 0).
-- **Deployment**: Runs as a pod in Kubernetes, uses in-cluster config, and exposes metrics on port 8080.
-- **Assumptions**:
-  - FIPS detection is simplistic (checks for "fips" in image name). In a real scenario, you’d need more robust logic (e.g., image metadata or labels).
-  - Requires RBAC permissions to list pods cluster-wide.
+    - `container_base_image_type`: Number of containers per base image type (from `/etc/os-release`).
+    - `containers_fips_compliant`: Total number of FIPS-compliant containers.
+  - Inspects `/etc/os-release` to determine base image type and FIPS compliance.
+- **FIPS Detection**: Heuristic-based, checking for "fips" in `/etc/os-release` (e.g., `FIPS_MODE=yes`) or known FIPS-compliant image patterns.
+- **Deployment**: Runs in Kubernetes with RBAC permissions for pod listing and exec.
 
 ---
 
@@ -34,6 +33,7 @@ Below is a Go program designed to run in Kubernetes, discover other workloads (p
 package main
 
 import (
+	"bytes"
 	"context"
 	"net/http"
 	"strings"
@@ -45,33 +45,53 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/remotecommand"
 	"log"
 )
 
 var (
+	// Metric for counting pods per namespace
+	podsPerNamespace = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "pods_per_namespace",
+			Help: "Number of pods running in each namespace",
+		},
+		[]string{"namespace"},
+	)
+
 	// Metric for counting containers per image
-	imageCount = prometheus.NewGaugeVec(
+	containerImageCount = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Name: "container_image_count",
-			Help: "Number of containers running a specific image",
+			Help: "Number of containers running each image",
 		},
 		[]string{"image"},
 	)
 
-	// Metric for FIPS-enabled workloads
-	fipsEnabled = prometheus.NewGaugeVec(
+	// Metric for counting containers by base image type
+	containerBaseImageType = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
-			Name: "workload_fips_enabled",
-			Help: "Indicates if a workload is running FIPS-enabled images (1 = yes, 0 = no)",
+			Name: "container_base_image_type",
+			Help: "Number of containers running each base image type based on /etc/os-release",
 		},
-		[]string{"namespace", "pod"},
+		[]string{"base_type"},
+	)
+
+	// Metric for counting FIPS-compliant containers
+	containersFipsCompliant = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "containers_fips_compliant",
+			Help: "Total number of containers running in FIPS-compliant mode",
+		},
 	)
 )
 
 func main() {
 	// Register Prometheus metrics
-	prometheus.MustRegister(imageCount)
-	prometheus.MustRegister(fipsEnabled)
+	prometheus.MustRegister(podsPerNamespace)
+	prometheus.MustRegister(containerImageCount)
+	prometheus.MustRegister(containerBaseImageType)
+	prometheus.MustRegister(containersFipsCompliant)
 
 	// Set up Kubernetes in-cluster config
 	config, err := rest.InClusterConfig()
@@ -91,13 +111,14 @@ func main() {
 	}()
 
 	// Periodically discover workloads and update metrics
+	log.Println("Starting workload discovery...")
 	for {
-		updateMetrics(clientset)
+		updateMetrics(clientset, config)
 		time.Sleep(30 * time.Second) // Refresh every 30 seconds
 	}
 }
 
-func updateMetrics(clientset *kubernetes.Clientset) {
+func updateMetrics(clientset *kubernetes.Clientset, config *rest.Config) {
 	// List all pods in the cluster
 	pods, err := clientset.CoreV1().Pods("").List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
@@ -106,69 +127,173 @@ func updateMetrics(clientset *kubernetes.Clientset) {
 	}
 
 	// Reset metrics to avoid stale data
-	imageCount.Reset()
-	fipsEnabled.Reset()
+	podsPerNamespace.Reset()
+	containerImageCount.Reset()
+	containerBaseImageType.Reset()
+	containersFipsCompliant.Set(0)
 
-	// Track image counts and FIPS status
+	// Track pod counts, image counts, base image types, and FIPS compliance
+	namespaceMap := make(map[string]float64)
 	imageMap := make(map[string]float64)
+	baseTypeMap := make(map[string]float64)
+	fipsCount := 0.0
+
 	for _, pod := range pods.Items {
-		isFips := false
+		// Increment namespace count
+		namespaceMap[pod.Namespace]++
+
 		for _, container := range pod.Spec.Containers {
 			// Increment image count
-			image := container.Image
-			imageMap[image] = imageMap[image] + 1
+			imageMap[container.Image]++
 
-			// Check for FIPS (simple heuristic: "fips" in image name)
-			if strings.Contains(strings.ToLower(image), "fips") {
-				isFips = true
+			// Determine base image type and FIPS compliance
+			baseType, isFips := getContainerDetails(clientset, config, pod, container)
+			baseTypeMap[baseType]++
+			if isFips {
+				fipsCount++
 			}
 		}
-
-		// Set FIPS metric for the pod
-		fipsValue := 0.0
-		if isFips {
-			fipsValue = 1.0
-		}
-		fipsEnabled.WithLabelValues(pod.Namespace, pod.Name).Set(fipsValue)
 	}
 
-	// Set image count metrics
-	for image, count := range imageMap {
-		imageCount.WithLabelValues(image).Set(count)
+	// Update Prometheus metrics
+	for ns, count := range namespaceMap {
+		podsPerNamespace.WithLabelValues(ns).Set(count)
 	}
+	for img, count := range imageMap {
+		containerImageCount.WithLabelValues(img).Set(count)
+	}
+	for baseType, count := range baseTypeMap {
+		containerBaseImageType.WithLabelValues(baseType).Set(count)
+	}
+	containersFipsCompliant.Set(fipsCount)
 
-	log.Printf("Updated metrics for %d pods", len(pods.Items))
+	log.Printf("Updated metrics for %d pods, %.0f FIPS-compliant containers", len(pods.Items), fipsCount)
 }
 
-// Simple heuristic to detect FIPS-enabled images
-func isFipsImage(image string) bool {
-	return strings.Contains(strings.ToLower(image), "fips")
+// getContainerDetails executes a command to read /etc/os-release and determines base type and FIPS status
+func getContainerDetails(clientset *kubernetes.Clientset, config *rest.Config, pod corev1.Pod, container corev1.Container) (baseType string, isFips bool) {
+	// Command to read /etc/os-release
+	cmd := []string{"cat", "/etc/os-release"}
+	req := clientset.CoreV1().RESTClient().Post().
+		Resource("pods").
+		Namespace(pod.Namespace).
+		Name(pod.Name).
+		SubResource("exec").
+		VersionedParams(&corev1.PodExecOptions{
+			Container: container.Name,
+			Command:   cmd,
+			Stdin:     false,
+			Stdout:    true,
+			Stderr:    true,
+			TTY:       false,
+		}, metav1.ParameterCodec)
+
+	exec, err := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
+	if err != nil {
+		log.Printf("Failed to create executor for pod %s/%s: %v", pod.Namespace, pod.Name, err)
+		return "Unknown", false
+	}
+
+	// Execute the command and capture output
+	var stdout, stderr bytes.Buffer
+	err = exec.StreamWithContext(context.TODO(), remotecommand.StreamOptions{
+		Stdout: &stdout,
+		Stderr: &stderr,
+	})
+	if err != nil {
+		log.Printf("Failed to exec in pod %s/%s container %s: %v, stderr: %s", pod.Namespace, pod.Name, container.Name, err, stderr.String())
+		// Fallback to image name heuristic for FIPS
+		return "Unknown", isFipsFromImageName(container.Image)
+	}
+
+	// Parse /etc/os-release for base type and FIPS status
+	osRelease := stdout.String()
+	baseType = parseOsRelease(osRelease)
+	isFips = isFipsCompliant(osRelease, container.Image)
+	return baseType, isFips
+}
+
+// parseOsRelease extracts the base image type from /etc/os-release content
+func parseOsRelease(content string) string {
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		lowerLine := strings.ToLower(line)
+		if strings.HasPrefix(lowerLine, "id=") || strings.HasPrefix(lowerLine, "name=") {
+			value := strings.TrimPrefix(lowerLine, "id=")
+			value = strings.TrimPrefix(value, "name=")
+			value = strings.Trim(value, "\"")
+
+			switch {
+			case strings.Contains(value, "debian"):
+				return "Debian"
+			case strings.Contains(value, "ubuntu"):
+				return "Ubuntu"
+			case strings.Contains(value, "alpine"):
+				return "Alpine"
+			case strings.Contains(value, "centos") || strings.Contains(value, "rhel") || strings.Contains(value, "ubi"):
+				return "RHEL"
+			case strings.Contains(value, "chainguard"):
+				return "Chainguard"
+			default:
+				return "Other"
+			}
+		}
+	}
+	return "Unknown"
+}
+
+// isFipsCompliant checks if the container is FIPS-compliant based on /etc/os-release or image name
+func isFipsCompliant(osRelease, image string) bool {
+	lowerOsRelease := strings.ToLower(osRelease)
+	// Check /etc/os-release for FIPS indicators
+	if strings.Contains(lowerOsRelease, "fips_mode=yes") || strings.Contains(lowerOsRelease, "fips=1") {
+		return true
+	}
+
+	// Fallback to image name heuristic if /etc/os-release doesn’t confirm FIPS
+	return isFipsFromImageName(image)
+}
+
+// isFipsFromImageName checks for FIPS indicators in the image name as a fallback
+func isFipsFromImageName(image string) bool {
+	lowerImage := strings.ToLower(image)
+	fipsIndicators := []string{
+		"fips",
+		"ubi8-fips",       // Red Hat UBI FIPS variant
+		"debian:fips",     // Hypothetical Debian FIPS
+		"chainguard:fips", // Hypothetical Chainguard FIPS
+	}
+	for _, indicator := range fipsIndicators {
+		if strings.Contains(lowerImage, indicator) {
+			return true
+		}
+	}
+	return false
 }
 ```
 
 ---
 
 ### Explanation
-1. **Dependencies**:
-   - `k8s.io/client-go`: Interacts with the Kubernetes API.
-   - `github.com/prometheus/client_golang`: Exposes metrics for Prometheus.
+1. **New Metric**:
+   - `containers_fips_compliant`: A gauge tracking the total number of FIPS-compliant containers across the cluster.
 
-2. **Metrics**:
-   - `container_image_count`: A gauge tracking how many containers use each image (e.g., `nginx:1.23` might have 5 instances).
-   - `workload_fips_enabled`: A gauge per pod (namespace + name), set to 1 if any container uses a FIPS-enabled image, 0 otherwise.
+2. **FIPS Detection**:
+   - **Primary Check**: Inspects `/etc/os-release` for explicit FIPS indicators like `FIPS_MODE=yes` or `FIPS=1` (common in FIPS-enabled RHEL or UBI images).
+   - **Fallback**: If `/etc/os-release` is missing or inconclusive, checks the image name for "fips" or known FIPS-compliant patterns (e.g., `ubi8-fips`).
+   - **Limitations**: This is heuristic-based. True FIPS compliance might require checking kernel settings (e.g., `fips=1` in boot params) or image metadata, which isn’t feasible via exec alone.
 
-3. **Logic**:
-   - Uses in-cluster config (`rest.InClusterConfig()`) to authenticate with the Kubernetes API.
-   - Lists all pods cluster-wide every 30 seconds.
-   - Counts images and checks for "fips" in image names (a placeholder—you’d replace this with real FIPS detection logic).
-   - Resets and updates Prometheus gauges to reflect current state.
+3. **Logic Updates**:
+   - `getContainerDetails`: Now returns both base image type and FIPS status by calling `parseOsRelease` and `isFipsCompliant`.
+   - `updateMetrics`: Increments `fipsCount` when a container is FIPS-compliant and updates the new metric.
+   - Metrics are reset each cycle to reflect the current state.
 
-4. **Metrics Server**: Runs on `:8080`, exposing `/metrics` for Prometheus scraping.
+4. **Dependencies**: No new dependencies added; still uses `client-go` and `prometheus/client_golang`.
 
 ---
 
 ### Dockerfile
-To run this in Kubernetes, build it into a container image:
+Unchanged from before:
 ```dockerfile
 # Build stage
 FROM golang:1.21 AS builder
@@ -195,7 +320,7 @@ docker build -t workload-discovery:latest .
 ---
 
 ### Kubernetes Deployment
-Deploy the program as a pod with RBAC permissions to list pods:
+The deployment and RBAC remain the same, as `pods/exec` permissions were already added:
 
 #### Deployment YAML
 ```yaml
@@ -203,7 +328,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: workload-discovery
-  namespace: monitoring
+  namespace: default
 spec:
   replicas: 1
   selector:
@@ -229,13 +354,13 @@ spec:
             memory: "256Mi"
 ```
 
-#### Service YAML (for Prometheus scraping)
+#### Service YAML
 ```yaml
 apiVersion: v1
 kind: Service
 metadata:
   name: workload-discovery
-  namespace: monitoring
+  namespace: default
   labels:
     app: workload-discovery
 spec:
@@ -253,7 +378,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: workload-discovery-sa
-  namespace: monitoring
+  namespace: default
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -264,6 +389,9 @@ rules:
 - apiGroups: [""]
   resources: ["pods"]
   verbs: ["list"]
+- apiGroups: [""]
+  resources: ["pods/exec"]
+  verbs: ["create"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -273,7 +401,7 @@ metadata:
 subjects:
 - kind: ServiceAccount
   name: workload-discovery-sa
-  namespace: monitoring
+  namespace: default
 roleRef:
   kind: ClusterRole
   name: workload-discovery-role
@@ -288,12 +416,12 @@ kubectl apply -f deployment.yaml -f service.yaml -f rbac.yaml
 ---
 
 ### Prometheus Integration
-Configure Prometheus to scrape the metrics:
+Update your Prometheus config:
 ```yaml
 scrape_configs:
   - job_name: 'workload-discovery'
     static_configs:
-      - targets: ['workload-discovery.monitoring.svc.cluster.local:8080']
+      - targets: ['workload-discovery.default.svc.cluster.local:8080']
 ```
 
 ---
@@ -301,25 +429,40 @@ scrape_configs:
 ### Sample Metrics Output
 After running, you might see:
 ```
-# HELP container_image_count Number of containers running a specific image
-# TYPE container_image_count gauge
-container_image_count{image="nginx:1.23"} 3
-container_image_count{image="registry.fips.com/ubuntu-fips:20.04"} 2
+# HELP pods_per_namespace Number of pods running in each namespace
+# TYPE pods_per_namespace gauge
+pods_per_namespace{namespace="default"} 3
+pods_per_namespace{namespace="kube-system"} 5
 
-# HELP workload_fips_enabled Indicates if a workload is running FIPS-enabled images (1 = yes, 0 = no)
-# TYPE workload_fips_enabled gauge
-workload_fips_enabled{namespace="default",pod="nginx-abc123"} 0
-workload_fips_enabled{namespace="monitoring",pod="fips-app-xyz789"} 1
+# HELP container_image_count Number of containers running each image
+# TYPE container_image_count gauge
+container_image_count{image="nginx:1.23"} 2
+container_image_count{image="coredns:1.9.3"} 2
+container_image_count{image="ubi8-fips:8.6"} 1
+
+# HELP container_base_image_type Number of containers running each base image type based on /etc/os-release
+# TYPE container_base_image_type gauge
+container_base_image_type{base_type="Debian"} 1
+container_base_image_type{base_type="Alpine"} 3
+container_base_image_type{base_type="RHEL"} 2
+container_base_image_type{base_type="Unknown"} 2
+
+# HELP containers_fips_compliant Total number of containers running in FIPS-compliant mode
+# TYPE containers_fips_compliant gauge
+containers_fips_compliant 1
 ```
 
 ---
 
 ### Notes and Improvements
-1. **FIPS Detection**: The current `isFipsImage` function is a placeholder. Enhance it by:
-   - Checking image labels (e.g., `kubectl get pod -o json | jq '.spec.containers[].image'`) for FIPS metadata.
-   - Querying a registry API or image manifest for FIPS compliance.
-2. **Error Handling**: Add retries or exponential backoff for API failures.
-3. **Security**: Use a non-root user and minimal base image (done with `alpine` and `USER 1001`).
-4. **Metrics**: Add more granularity (e.g., per-container FIPS status, image digest).
+1. **FIPS Detection**:
+   - Currently checks `/etc/os-release` for explicit FIPS flags and falls back to image name patterns. This is a heuristic—true FIPS compliance might require:
+     - Checking `/proc/sys/crypto/fips_enabled` (if accessible).
+     - Querying image metadata or pod annotations.
+   - Some containers (e.g., `scratch`) lack `/etc/os-release`, so the fallback to image name is critical.
+2. **Base Image Detection**: Same limitations as before—relies on `/etc/os-release` presence.
+3. **Performance**: Exec calls add latency; for large clusters, consider sampling or caching results.
+4. **Granularity**: Could extend `containers_fips_compliant` to a vector with labels (e.g., per namespace or pod).
+5. **Error Handling**: Logs errors and defaults to "Unknown"/non-FIPS; add retries for robustness.
 
-This program gives you a starting point to monitor Kubernetes workloads and their images, with Prometheus-ready metrics for observability. Deploy it, tweak as needed, and pair it with a Prometheus/Grafana stack for visualization!
+This updated program now tracks FIPS compliance alongside other workload details, emitting all data as Prometheus metrics. Deploy it, scrape with Prometheus, and visualize the results! Let me know if you need further tweaks.
