@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.21 AS builder
+FROM cgr.dev/chainguard/go:latest-dev AS builder
 WORKDIR /app
 COPY . .
 RUN go mod init workload-discovery && \
@@ -8,8 +8,8 @@ RUN go mod init workload-discovery && \
     CGO_ENABLED=0 GOOS=linux go build -o workload-discovery .
 
 # Runtime stage
-FROM alpine:3.19
+FROM cgr.dev/ky-rafaels.example.com/chainguard-base:20230214
 COPY --from=builder /app/workload-discovery /usr/local/bin/
-RUN apk add --no-cache ca-certificates
+# RUN apk add --no-cache ca-certificates
 USER 1001
 CMD ["workload-discovery"]
