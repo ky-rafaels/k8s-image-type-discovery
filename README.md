@@ -195,6 +195,7 @@ container_image_count{image="ubi8-fips:8.6"} 1
 container_base_image_type{base_type="Debian"} 1
 container_base_image_type{base_type="Alpine"} 3
 container_base_image_type{base_type="RHEL"} 2
+container_base_image_type{base_type="Chainguard"} 2
 container_base_image_type{base_type="Unknown"} 2
 
 # HELP containers_fips_compliant Total number of containers running in FIPS-compliant mode
