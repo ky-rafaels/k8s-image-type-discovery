@@ -175,6 +175,8 @@ func parseOsRelease(content string) string {
 		if strings.HasPrefix(lowerLine, "id=") {
 			id := strings.Trim(strings.TrimPrefix(lowerLine, "id="), `"`)
 			switch id {
+			case "wolfi":
+				return "chainguard"
 			case "debian":
 				return "debian"
 			case "ubuntu":
