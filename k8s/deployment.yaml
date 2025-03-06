@@ -2,7 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: workload-discovery
-  namespace: default
+  namespace: image-type-discovery
 spec:
   replicas: 1
   selector:
@@ -16,7 +16,7 @@ spec:
       serviceAccountName: workload-discovery-sa
       containers:
       - name: workload-discovery
-        image: workload-discovery:latest
+        image: localhost:5000/go-discovery-service:v0.0.1
         ports:
         - containerPort: 8080
         resources:

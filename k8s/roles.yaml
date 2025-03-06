@@ -2,8 +2,7 @@ apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: workload-discovery-sa
-  namespace: default
-
+  namespace: image-type-discovery
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -25,7 +24,7 @@ metadata:
 subjects:
 - kind: ServiceAccount
   name: workload-discovery-sa
-  namespace: default
+  namespace: image-type-discovery
 roleRef:
   kind: ClusterRole
   name: workload-discovery-role

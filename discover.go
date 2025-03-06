@@ -85,7 +85,7 @@ func main() {
 
 	// Run discovery loop
 	logger.Info("Starting workload discovery")
-	ticker := time.NewTicker(30 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
 
 	ctx := context.Background()
