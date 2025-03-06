@@ -192,13 +192,13 @@ func parseOsRelease(content string) string {
 			value = strings.Trim(value, "\"")
 
 			switch {
-			case strings.Contains(value, "debian"):
+			case strings.Contains(value, "debian") || strings.Contains(value, "ubuntu"):
 				return "Debian"
 			case strings.Contains(value, "alpine"):
 				return "Alpine"
 			case strings.Contains(value, "centos") || strings.Contains(value, "rhel") || strings.Contains(value, "ubi"):
 				return "RHEL"
-			case strings.Contains(value, "wolfi"):
+			case strings.Contains(value, "wolfi")|| strings.Contains(value, "chainguard"):
 				return "Chainguard"
 			default:
 				return "Other"

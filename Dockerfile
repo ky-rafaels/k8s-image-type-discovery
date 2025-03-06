@@ -1,15 +1,16 @@
 # Build stage
 FROM cgr.dev/chainguard/go:latest-dev AS builder
 WORKDIR /app
-COPY . .
-RUN go mod init workload-discovery && \
+COPY discovery.go .
+USER root
+RUN go mod init go-discover && \
     go get k8s.io/client-go@v0.29.0 && \
     go get github.com/prometheus/client_golang@v1.19.0 && \
-    CGO_ENABLED=0 GOOS=linux go build -o workload-discovery .
+    CGO_ENABLED=0 GOOS=linux go build -o go-discover .
 
 # Runtime stage
 FROM cgr.dev/ky-rafaels.example.com/chainguard-base:20230214
-COPY --from=builder /app/workload-discovery /usr/local/bin/
+WORKDIR /
+COPY --from=builder /app/go-discover .
 # RUN apk add --no-cache ca-certificates
-USER 1001
-CMD ["workload-discovery"]
+CMD ["go-discover"]
